@@ -1,73 +1,120 @@
 const http = require("http");
-const https = require("https");
-const WebSocket = require("ws");
+const { WebSocketServer } = require("ws");
 
-const PORT = process.env.PORT || 3000;
-const KEEP_ALIVE_INTERVAL_MS = 11 * 60 * 1000; // 11 minutes (< 15 min Render idle timeout)
-const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL || "";
+const PORT = process.env.PORT || 10000;
 
-// Standard HTTP handler so Render health checks and browser visits don't fail awkwardly
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("WebSocket relay is running.");
+  res.end("Relay server is running");
 });
 
-// Attach WebSocket server to the same HTTP server instance
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server, maxPayload: 100 * 1024 * 1024 });
 
-wss.on("connection", (ws, req) => {
-  const clientIp = req.socket.remoteAddress;
-  console.log(`Client connected from ${clientIp}`);
+const clients = new Set();
 
-  ws.on("message", (data, isBinary) => {
-    // Relay messages to other connected peers (e.g., browser <-> Android client)
-    wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(data, { binary: isBinary });
+function sendJson(ws, obj) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+function getByRole(role) {
+  return Array.from(clients).filter((c) => c.readyState === 1 && c.role === role);
+}
+
+wss.on("connection", (ws) => {
+  ws.role = "unknown";
+  ws.deviceId = "";
+  clients.add(ws);
+
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (_) {
+      return;
+    }
+    if (!msg || typeof msg !== "object") return;
+
+    if (msg.type === "REGISTER" || msg.action === "REGISTER") {
+      ws.role = String(msg.role || "unknown").toLowerCase();
+      ws.deviceId = String(msg.deviceId || "");
+      sendJson(ws, { type: "REGISTERED", role: ws.role, deviceId: ws.deviceId });
+      return;
+    }
+
+    const msgType = String(msg.type || "").toUpperCase();
+    const action = String(msg.action || "").toUpperCase();
+
+    const dataServers = getByRole("data_server");
+    const phones = getByRole("phone");
+    const viewers = getByRole("viewer");
+
+    // 1. Phone -> data-server ingestion & acknowledgements
+    if (
+      msgType === "INGEST_CHUNK" || action === "INGEST_CHUNK" ||
+      msgType === "FILE_CHUNK" || action === "FILE_CHUNK" ||
+      msgType === "LIVE_AUDIO_CHUNK" || action === "LIVE_AUDIO_CHUNK"
+    ) {
+      for (const ds of dataServers) sendJson(ds, msg);
+      return;
+    }
+
+    if (
+      msgType === "INGEST_ACK" ||
+      msgType === "FILE_CHUNK_ACK" ||
+      msgType === "LIVE_AUDIO_ACK"
+    ) {
+      for (const ph of phones) sendJson(ph, msg);
+      return;
+    }
+
+    // 2. Viewer -> data-server queries
+    if (
+      action === "GET_BATCH_SUMMARY" ||
+      action === "GET_BATCH_ITEMS" ||
+      action === "GET_STORED_FILE" ||
+      action === "GET_LIVE_AUDIO"
+    ) {
+      if (dataServers.length > 0) {
+        for (const ds of dataServers) {
+          sendJson(ds, { ...msg, _replyToViewer: true });
+        }
+      } else {
+        for (const ph of phones) sendJson(ph, msg);
       }
-    });
-  });
+      return;
+    }
 
-  ws.on("close", (code, reason) => {
-    console.log(`Client disconnected (code: ${code}, reason: ${reason.toString()})`);
-  });
+    // 3. data-server -> Viewer responses
+    if (
+      msgType === "BATCH_SUMMARY" ||
+      msgType === "BATCH_ITEMS" ||
+      msgType === "STORED_FILE" ||
+      msgType === "STORED_FILE_MISSING" ||
+      msgType === "LIVE_AUDIO_ITEMS"
+    ) {
+      for (const vw of viewers) sendJson(vw, msg);
+      return;
+    }
 
-  ws.on("error", (err) => {
-    console.error("WebSocket client error:", err.message);
-  });
-});
+    // 4. Live Viewer -> Phone commands
+    if (msgType === "COMMAND" || action.startsWith("GET_") || action.startsWith("SYNC_")) {
+      for (const ph of phones) sendJson(ph, msg);
+      return;
+    }
 
-// Automated periodic ping every 11 minutes:
-// 1) Sends WebSocket ping frames to active connected clients
-// 2) Hits the public HTTP URL (if RENDER_EXTERNAL_URL is set) to register HTTP activity
-setInterval(() => {
-  console.log("[Keep-Alive] Running scheduled 11-minute ping...");
-
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      try {
-        client.ping();
-      } catch (err) {
-        console.error("[Keep-Alive] Socket ping failed:", err.message);
-      }
+    // 5. Phone -> Viewer live responses
+    for (const vw of viewers) {
+      if (vw !== ws) sendJson(vw, msg);
     }
   });
 
-  if (SELF_PING_URL) {
-    const clientModule = SELF_PING_URL.startsWith("https://") ? https : http;
-    clientModule
-      .get(SELF_PING_URL, (res) => {
-        console.log(`[Keep-Alive] Self-ping status: ${res.statusCode}`);
-        res.resume();
-      })
-      .on("error", (err) => {
-        console.error("[Keep-Alive] Self-ping error:", err.message);
-      });
-  } else {
-    console.log("[Keep-Alive] RENDER_EXTERNAL_URL not set; skipped HTTP self-ping.");
-  }
-}, KEEP_ALIVE_INTERVAL_MS);
+  ws.on("close", () => {
+    clients.delete(ws);
+  });
+});
 
 server.listen(PORT, () => {
-  console.log(`Relay server listening on port ${PORT}`);
+  console.log("Relay listening on port", PORT);
 });
